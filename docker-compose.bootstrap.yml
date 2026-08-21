@@ -1,0 +1,21 @@
+# Temporary stack: authenticate Tailscale BEFORE attaching to Nord.
+# Usage: docker compose -f docker-compose.bootstrap.yml up -d
+# After login + exit-node approval, switch to docker-compose.yml
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: nord-exit-tailscale
+    hostname: nord-exit
+    env_file:
+      - .env.tailscale
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_AUTH_ONCE=true
+    volumes:
+      - ./state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: "no"

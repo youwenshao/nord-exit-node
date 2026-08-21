@@ -1,0 +1,62 @@
+#!/usr/bin/with-contenv bash
+# Do not use set -e: Nord CLI returns non-zero during reconnect races.
+set -uo pipefail
+
+# Nord's container firewall uses OUTPUT/FORWARD DROP and only allowlists
+# NordLynx UDP/51820 (+443/tcp). That blocks Tailscale WireGuard UDP, forcing
+# flaky DERP-TCP for the exit node. Re-open UDP on eth0 + TS↔Nord forward.
+
+apply_tailscale_firewall_holes() {
+  iptables -C OUTPUT -o eth0 -p udp -j ACCEPT 2>/dev/null \
+    || iptables -I OUTPUT -o eth0 -p udp -j ACCEPT
+  iptables -C OUTPUT -o eth0 -p icmp -j ACCEPT 2>/dev/null \
+    || iptables -I OUTPUT -o eth0 -p icmp -j ACCEPT
+  iptables -C FORWARD -i tailscale0 -o nordlynx -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD -i tailscale0 -o nordlynx -j ACCEPT
+  iptables -C FORWARD -i nordlynx -o tailscale0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD -i nordlynx -o tailscale0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  iptables -C FORWARD -i tailscale0 -o eth0 -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD -i tailscale0 -o eth0 -j ACCEPT
+  iptables -t nat -C POSTROUTING -o nordlynx -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING -o nordlynx -j MASQUERADE
+}
+
+ensure_nord() {
+  nordvpn set technology "${TECHNOLOGY:-NordLynx}" >/dev/null 2>&1 || true
+  nordvpn set killswitch disabled >/dev/null 2>&1 || true
+  nordvpn set firewall disabled >/dev/null 2>&1 || true
+  nordvpn set autoconnect on >/dev/null 2>&1 || true
+  nordvpn whitelist add subnet 100.64.0.0/10 >/dev/null 2>&1 || true
+
+  if [[ -n "${TOKEN:-}" ]]; then
+    nordvpn login --token "$TOKEN" >/dev/null 2>&1 || true
+  fi
+
+  if ! nordvpn status 2>/dev/null | grep -q "Status: Connected"; then
+    echo "[nord-connect] connecting to ${CONNECT:-Barcelona}"
+    if [[ -n "${CONNECT:-}" ]]; then
+      nordvpn connect "$CONNECT" >/dev/null 2>&1 || nordvpn connect >/dev/null 2>&1 || true
+    else
+      nordvpn connect >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+echo "[nord-connect] waiting for nordvpnd..."
+for _ in $(seq 1 90); do
+  if nordvpn status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+ensure_nord
+nordvpn status || true
+apply_tailscale_firewall_holes
+echo "[nord-connect] Tailscale UDP/FORWARD holes applied"
+
+while true; do
+  sleep 20
+  ensure_nord
+  apply_tailscale_firewall_holes
+done

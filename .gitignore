@@ -1,0 +1,7 @@
+.env
+state/
+*.log
+AUTH_URL.txt
+.env.tailscale
+wireguard/*.conf
+host-wg/*.conf
