@@ -12,9 +12,11 @@ services:
     environment:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
-      - TS_AUTH_ONCE=true
-      - TS_AUTHKEY=${TS_AUTHKEY:-}
       - TS_HOSTNAME=${TS_HOSTNAME:-nord-exit}
+    # Run tailscaled directly so interactive login is not killed by
+    # containerboot's ~60s auth deadline.
+    entrypoint: ["tailscaled"]
+    command: ["--statedir=/var/lib/tailscale", "--tun=tailscale0"]
     volumes:
       - ./state:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun

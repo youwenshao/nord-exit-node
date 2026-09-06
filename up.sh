@@ -61,8 +61,14 @@ write_env_tailscale() {
 }
 
 ts_backend_state() {
-  docker exec nord-exit-tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true
+  local sock json
+  for sock in /tmp/tailscaled.sock /var/run/tailscale/tailscaled.sock; do
+    json=$(docker exec nord-exit-tailscale tailscale --socket="$sock" status --json 2>/dev/null || true)
+    if [[ -n "$json" ]]; then
+      printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true
+      return 0
+    fi
+  done
 }
 
 ensure_docker || exit 1
@@ -78,25 +84,40 @@ if docker compose ps --status running 2>/dev/null | grep -q nord-exit-tailscale;
   state="$(ts_backend_state)"
   [[ "$state" == "Running" ]] && need_bootstrap=0
 fi
-if [[ -f state/tailscaled.state ]]; then
-  need_bootstrap=0
+# A stub tailscaled.state is created before login. Only skip bootstrap when
+# the persisted node is actually authenticated.
+if [[ -s state/tailscaled.state ]] && [[ "$(wc -c <state/tailscaled.state)" -gt 500 ]]; then
+  if docker compose -f docker-compose.bootstrap.yml run --rm --no-deps \
+    tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
+    | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("BackendState")=="Running" else 1)' 2>/dev/null; then
+    need_bootstrap=0
+  fi
 fi
 
 if [[ "$need_bootstrap" -eq 1 ]]; then
   echo "=== Phase 1: bootstrap Tailscale login (without Nord) ==="
   docker compose -f docker-compose.bootstrap.yml up -d
+  for local_i in $(seq 1 30); do
+    docker exec nord-exit-tailscale tailscale --socket=/var/run/tailscale/tailscaled.sock status >/dev/null 2>&1 && break
+    docker exec nord-exit-tailscale tailscale status >/dev/null 2>&1 && break
+    sleep 1
+  done
+  docker exec -d nord-exit-tailscale tailscale up \
+    --reset --accept-dns=false --advertise-exit-node --hostname="$TS_HOSTNAME" || true
   echo "Waiting for auth URL..."
   url=""
   state=""
-  local_i=0
-  for local_i in $(seq 1 60); do
-    url=$(docker logs nord-exit-tailscale 2>&1 | grep -oE 'https://login\.tailscale\.com/a/[a-z0-9]+' | tail -1 || true)
+  for local_i in $(seq 1 90); do
     state="$(ts_backend_state)"
     if [[ "$state" == "Running" ]]; then
       echo "Already authenticated."
       break
     fi
-    if [[ -n "$url" ]]; then
+    url=$(docker logs nord-exit-tailscale 2>&1 | grep -oE 'https://login\.tailscale\.com/a/[a-z0-9]+' | tail -1 || true)
+    if [[ -z "$url" ]]; then
+      url=$(docker exec nord-exit-tailscale tailscale status 2>&1 | grep -oE 'https://login\.tailscale\.com/a/[a-z0-9]+' | tail -1 || true)
+    fi
+    if [[ -n "$url" && ! -f AUTH_URL.txt ]]; then
       echo "$url" | tee AUTH_URL.txt
       if [[ "$OS" == darwin ]]; then
         open "$url" || true
@@ -104,21 +125,17 @@ if [[ "$need_bootstrap" -eq 1 ]]; then
       echo
       echo "Sign in with your Tailscale account, then return here."
       echo "Auth URL also written to AUTH_URL.txt"
-      break
     fi
     sleep 2
   done
-  if [[ -z "$url" && "$state" != "Running" ]]; then
-    echo "No auth URL yet. Check: docker logs nord-exit-tailscale" >&2
-  fi
   echo "Waiting until nord-exit is Running..."
-  for local_i in $(seq 1 120); do
+  for local_i in $(seq 1 180); do
     state="$(ts_backend_state)"
     if [[ "$state" == "Running" ]]; then
       echo "Tailscale authenticated."
       break
     fi
-    sleep 3
+    sleep 2
   done
   state="$(ts_backend_state)"
   if [[ "$state" != "Running" ]]; then
