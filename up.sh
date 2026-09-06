@@ -1,82 +1,109 @@
 #!/usr/bin/env bash
+# Bring up the Nord + Tailscale exit-node stack on this machine.
 set -euo pipefail
 cd "$(dirname "$0")"
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+env_get() {
+  local key="$1"
+  [[ -f .env ]] || return 0
+  grep -E "^${key}=" .env | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"
+}
 
 if [[ ! -f .env ]]; then
-  echo "Missing .env — set TOKEN / CONNECT first" >&2
+  echo "Missing .env — copy .env.example and set TOKEN / CONNECT / TS_AUTHKEY" >&2
   exit 1
 fi
 
-TOKEN=$(python3 - <<'PY'
-from pathlib import Path
-for line in Path(".env").read_text().splitlines():
-    if line.startswith("TOKEN="):
-        print(line.split("=", 1)[1].strip().strip('"').strip("'"))
-        break
-PY
-)
+TOKEN="$(env_get TOKEN)"
 if [[ -z "${TOKEN:-}" ]]; then
   echo "TOKEN is empty in .env" >&2
   exit 1
 fi
 
-if ! docker info >/dev/null 2>&1; then
-  echo "Docker is not running. Opening Docker Desktop..." >&2
-  open -a Docker
+TS_AUTHKEY="$(env_get TS_AUTHKEY)"
+TS_HOSTNAME="$(env_get TS_HOSTNAME)"
+TS_HOSTNAME="${TS_HOSTNAME:-nord-exit}"
+TS_EXTRA_ARGS="$(env_get TS_EXTRA_ARGS)"
+TS_EXTRA_ARGS="${TS_EXTRA_ARGS:---advertise-exit-node --accept-dns=false}"
+
+ensure_docker() {
+  if docker info >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "$OS" == darwin ]]; then
+    echo "Docker is not running. Opening Docker Desktop..." >&2
+    open -a Docker
+  else
+    echo "Docker is not running. Starting docker.service..." >&2
+    sudo -n systemctl start docker 2>/dev/null || sudo systemctl start docker
+  fi
+  local _
   for _ in $(seq 1 60); do
-    docker info >/dev/null 2>&1 && break
+    docker info >/dev/null 2>&1 && return 0
     sleep 2
   done
-  docker info >/dev/null 2>&1 || {
-    echo "Docker still unavailable" >&2
-    exit 1
-  }
-fi
+  echo "Docker still unavailable" >&2
+  return 1
+}
 
+write_env_tailscale() {
+  # docker env_file: do not quote TS_EXTRA_ARGS
+  umask 077
+  {
+    printf 'TS_HOSTNAME=%s\n' "$TS_HOSTNAME"
+    printf 'TS_EXTRA_ARGS=%s\n' "$TS_EXTRA_ARGS"
+    if [[ -n "${TS_AUTHKEY:-}" ]]; then
+      printf 'TS_AUTHKEY=%s\n' "$TS_AUTHKEY"
+    fi
+  } >.env.tailscale
+  chmod 600 .env.tailscale
+}
+
+ts_backend_state() {
+  docker exec nord-exit-tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true
+}
+
+ensure_docker || exit 1
 mkdir -p state
-# Keep TS_EXTRA_ARGS unquoted for docker env_file (docker handles the line)
-if [[ ! -f .env.tailscale ]]; then
-  cat > .env.tailscale <<'EOF'
-TS_HOSTNAME=nord-exit
-TS_EXTRA_ARGS=--advertise-exit-node --accept-dns=false
-EOF
-fi
+write_env_tailscale
 
-# If Tailscale state is not logged in yet, bootstrap on a normal network first
-# (Nord's DNS/routing can block the interactive login handshake).
 need_bootstrap=1
-if [[ -d state ]] && docker compose -f docker-compose.bootstrap.yml run --rm --no-deps \
-  -e TS_AUTHKEY=dummy tailscale true >/dev/null 2>&1; then
-  :
+if [[ -n "${TS_AUTHKEY:-}" ]]; then
+  echo "TS_AUTHKEY present — skipping interactive Tailscale login."
+  need_bootstrap=0
 fi
 if docker compose ps --status running 2>/dev/null | grep -q nord-exit-tailscale; then
-  state=$(docker exec nord-exit-tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)
+  state="$(ts_backend_state)"
   [[ "$state" == "Running" ]] && need_bootstrap=0
 fi
-# Detect persisted login in state dir
 if [[ -f state/tailscaled.state ]]; then
   need_bootstrap=0
 fi
 
-if [[ ! -f state/tailscaled.state ]]; then
+if [[ "$need_bootstrap" -eq 1 ]]; then
   echo "=== Phase 1: bootstrap Tailscale login (without Nord) ==="
   docker compose -f docker-compose.bootstrap.yml up -d
   echo "Waiting for auth URL..."
   url=""
-  for i in $(seq 1 60); do
+  state=""
+  local_i=0
+  for local_i in $(seq 1 60); do
     url=$(docker logs nord-exit-tailscale 2>&1 | grep -oE 'https://login\.tailscale\.com/a/[a-z0-9]+' | tail -1 || true)
-    state=$(docker exec nord-exit-tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)
+    state="$(ts_backend_state)"
     if [[ "$state" == "Running" ]]; then
       echo "Already authenticated."
       break
     fi
     if [[ -n "$url" ]]; then
       echo "$url" | tee AUTH_URL.txt
-      open "$url" || true
+      if [[ "$OS" == darwin ]]; then
+        open "$url" || true
+      fi
       echo
-      echo "Sign in with your Tailscale account (GitHub for youwenshao.github), then return here."
+      echo "Sign in with your Tailscale account, then return here."
+      echo "Auth URL also written to AUTH_URL.txt"
       break
     fi
     sleep 2
@@ -85,17 +112,15 @@ if [[ ! -f state/tailscaled.state ]]; then
     echo "No auth URL yet. Check: docker logs nord-exit-tailscale" >&2
   fi
   echo "Waiting until nord-exit is Running..."
-  for i in $(seq 1 120); do
-    state=$(docker exec nord-exit-tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)
+  for local_i in $(seq 1 120); do
+    state="$(ts_backend_state)"
     if [[ "$state" == "Running" ]]; then
       echo "Tailscale authenticated."
       break
     fi
     sleep 3
   done
-  state=$(docker exec nord-exit-tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)
+  state="$(ts_backend_state)"
   if [[ "$state" != "Running" ]]; then
     echo "Still not logged in. Authenticate via AUTH_URL.txt then re-run ./up.sh" >&2
     exit 2
@@ -129,6 +154,5 @@ docker exec nord-exit-vpn curl -4 -fsS --max-time 10 https://ipinfo.io/json || t
 echo
 echo
 echo "Next:"
-echo "  1) Admin console → nord-exit → Edit route settings → enable Use as exit node"
-echo "     https://login.tailscale.com/admin/machines"
-echo "  2) On this Mac: ./use-exit.sh on"
+echo "  1) If this is a new tailnet, add autoApprovers.exitNode (see docs/tailscale-acl.md)"
+echo "  2) On a client: nord-exit on"

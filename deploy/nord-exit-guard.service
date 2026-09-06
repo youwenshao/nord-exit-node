@@ -1,0 +1,7 @@
+[Unit]
+Description=nord-exit desired-state guard
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash @STACK_DIR@/bin/nord-exit guard
+WorkingDirectory=@STACK_DIR@

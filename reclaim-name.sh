@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
+# Wait until an offline MagicDNS nord-exit name is gone, then rename the
+# local container node back to nord-exit.
 set -euo pipefail
-TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+if [[ -n "${TAILSCALE_CLI:-}" ]]; then
+  TS="$TAILSCALE_CLI"
+elif [[ "$OS" == darwin && -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
+  TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+else
+  TS="$(command -v tailscale 2>/dev/null || echo tailscale)"
+fi
+
 echo "Waiting until offline MagicDNS name nord-exit.tail*.ts.net is gone..."
 for i in $(seq 1 60); do
-  offline=$($TS status --json | python3 -c '
+  offline=$("$TS" status --json | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
 for p in d.get("Peer",{}).values():
@@ -11,7 +21,7 @@ for p in d.get("Peer",{}).values():
   if dns.startswith("nord-exit.") and not p.get("Online"):
     print("yes"); break
 ')
-  live=$($TS status --json | python3 -c '
+  live=$("$TS" status --json | python3 -c '
 import json,sys
 for p in json.load(sys.stdin).get("Peer",{}).values():
   if p.get("Online") and "nord-exit" in (p.get("DNSName") or ""):
@@ -24,7 +34,7 @@ for p in json.load(sys.stdin).get("Peer",{}).values():
     sleep 3
     docker exec nord-exit-tailscale tailscale --socket=/tmp/tailscaled.sock set --hostname=nord-exit --advertise-exit-node --accept-dns=false
     sleep 5
-    $TS status | rg nord || $TS status
+    "$TS" status | grep -i nord || "$TS" status
     echo "Done. Prefer: nord-exit (may take a minute for MagicDNS)."
     exit 0
   fi

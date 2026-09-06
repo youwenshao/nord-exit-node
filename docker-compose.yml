@@ -1,6 +1,7 @@
 # NordVPN (Linux) + Tailscale exit node
 # Internet egress for clients that select this exit node goes through Nord.
 # Mesh traffic stays on Tailscale (100.64.0.0/10 is allowlisted through Nord's kill switch).
+name: nord-exit
 services:
   vpn:
     image: ghcr.io/bubuntux/nordvpn:latest
@@ -50,6 +51,8 @@ services:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_AUTH_ONCE=true
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_HOSTNAME=${TS_HOSTNAME:-nord-exit}
     volumes:
       - ./state:/var/lib/tailscale
     cap_add:

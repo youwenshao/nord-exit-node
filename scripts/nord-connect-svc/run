@@ -21,6 +21,36 @@ apply_tailscale_firewall_holes() {
     || iptables -t nat -A POSTROUTING -o nordlynx -j MASQUERADE
 }
 
+# Firewall/killswitch stay off (DERP under Docker Desktop). Nord then often
+# leaves default via eth0 while resolv.conf points at Nord DNS — DNS dies
+# and ipinfo country comes back empty. Steer Internet via nordlynx; keep
+# Tailscale CGNAT and the NordLynx endpoint on the Docker bridge.
+# A default via nordlynx WITHOUT an endpoint /32 (or fwmark table) loops
+# WireGuard into itself: handshake may succeed, then 0 B received.
+ensure_nord_default_route() {
+  ip link show nordlynx >/dev/null 2>&1 || return 0
+  local gw="" dev="eth0" endpoint=""
+  gw=$(ip -4 route show 100.64.0.0/10 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')
+  if [[ -z "$gw" ]]; then
+    gw=$(ip -4 route show default 2>/dev/null | grep -v nordlynx | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')
+  fi
+  if [[ -z "$gw" ]]; then
+    gw=$(ip -4 route show dev eth0 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')
+  fi
+  [[ -n "$gw" ]] || return 0
+  endpoint=$(wg show nordlynx endpoints 2>/dev/null | awk '{print $2}' | head -1 | cut -d: -f1)
+  if [[ -n "$endpoint" ]]; then
+    ip -4 route replace "$endpoint" via "$gw" dev "$dev" 2>/dev/null || true
+  fi
+  if ! ip rule show 2>/dev/null | grep -q 'fwmark 0xe1f1'; then
+    ip rule add fwmark 0xe1f1 lookup 51820 2>/dev/null || true
+  fi
+  ip -4 route replace default via "$gw" dev "$dev" table 51820 2>/dev/null || true
+  ip -4 route replace 100.64.0.0/10 via "$gw" dev "$dev" 2>/dev/null || true
+  ip -4 route show default | grep -q nordlynx && return 0
+  ip -4 route replace default dev nordlynx 2>/dev/null || true
+}
+
 ensure_nord() {
   nordvpn set technology "${TECHNOLOGY:-NordLynx}" >/dev/null 2>&1 || true
   nordvpn set killswitch disabled >/dev/null 2>&1 || true
@@ -32,13 +62,12 @@ ensure_nord() {
     nordvpn login --token "$TOKEN" >/dev/null 2>&1 || true
   fi
 
-  if ! nordvpn status 2>/dev/null | grep -q "Status: Connected"; then
-    echo "[nord-connect] connecting to ${CONNECT:-Barcelona}"
-    if [[ -n "${CONNECT:-}" ]]; then
-      nordvpn connect "$CONNECT" >/dev/null 2>&1 || nordvpn connect >/dev/null 2>&1 || true
-    else
-      nordvpn connect >/dev/null 2>&1 || true
-    fi
+  # Image/account autoconnect may land on the last city (often HK). Always
+  # require CONNECT in the status text (e.g. Barcelona), not merely Connected.
+  want="${CONNECT:-Barcelona}"
+  if ! nordvpn status 2>/dev/null | grep -qi "$want"; then
+    echo "[nord-connect] connecting to $want"
+    nordvpn connect "$want" >/dev/null 2>&1 || nordvpn connect >/dev/null 2>&1 || true
   fi
 }
 
@@ -53,10 +82,12 @@ done
 ensure_nord
 nordvpn status || true
 apply_tailscale_firewall_holes
+ensure_nord_default_route
 echo "[nord-connect] Tailscale UDP/FORWARD holes applied"
 
 while true; do
   sleep 20
   ensure_nord
   apply_tailscale_firewall_holes
+  ensure_nord_default_route
 done
